@@ -14,8 +14,9 @@ concurrency:
 jobs:
   macos:
     name: macOS (universal)
-    # macos-14 runners are Apple silicon machines running macOS 14 Sonoma.
-    runs-on: macos-14
+    # Built on the current Apple silicon runner image. The app targets macOS 11+ (CMAKE_OSX_DEPLOYMENT_TARGET),
+    # so it runs on macOS 14 Sonoma regardless of the build machine's OS version.
+    runs-on: macos-latest
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4

@@ -36,7 +36,7 @@ follow `Read Me.txt` inside it. In short: drag the app to *Applications*, and co
 so on first launch right-click the app and choose **Open**, or run
 `xattr -dr com.apple.quarantine "/Applications/Stem Splitter.app"`.
 
-The DMG is a universal binary (Apple silicon + Intel) that runs on macOS 11 and later, built and tested on
+The DMG is a universal binary (Apple silicon + Intel) built for macOS 11 and later, so it runs on
 **macOS 14 Sonoma**.
 
 ## Using it
