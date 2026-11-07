@@ -1,0 +1,17 @@
+# Build output
+build/
+build-*/
+cmake-build-*/
+dist/
+
+# Downloaded neural-network weights (large; fetched by scripts/download_models.sh or the app)
+models/
+*.bin
+
+# IDE / OS
+.idea/
+.vscode/
+*.xcodeproj/
+xcuserdata/
+.DS_Store
+compile_commands.json

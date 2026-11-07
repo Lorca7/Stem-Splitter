@@ -1,0 +1,141 @@
+name: Build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: macOS (universal)
+    # macos-14 runners are Apple silicon machines running macOS 14 Sonoma.
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ninja
+        run: brew install ninja
+
+      - name: Cache models
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: demucs-models-v1
+
+      - name: Download models (4 and 6 stems)
+        run: scripts/download_models.sh models 4s 6s
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: deps-macos-${{ hashFiles('CMakeLists.txt', 'cmake/**') }}
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+          -DSTEMSPLITTER_MODEL_DIR="$PWD/models"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Separation smoke test with the real model
+        run: |
+          python3 - <<'EOF'
+          import wave, struct, math, random
+          sr = 44100; n = sr * 12; random.seed(1)
+          w = wave.open('smoke.wav', 'wb'); w.setnchannels(2); w.setsampwidth(2); w.setframerate(sr)
+          frames = bytearray()
+          for i in range(n):
+              t = i / sr
+              v = 0.3 * math.sin(2 * math.pi * 220 * t) + 0.2 * math.sin(2 * math.pi * 55 * t)
+              v += 0.3 * (random.random() * 2 - 1) * math.exp(-((i % (sr // 2)) / 1500.0))
+              s = int(max(-1, min(1, v)) * 32767)
+              frames += struct.pack('<hh', s, s)
+          w.writeframes(bytes(frames)); w.close()
+          EOF
+          STEMSPLITTER_MODEL_DIR="$PWD/models" build/stemsplit_artefacts/Release/stemsplit --engine 4 --out smoke-out smoke.wav
+          ls -la smoke-out
+
+      - name: Check binaries are universal
+        run: |
+          lipo -info "build/StemSplitter_artefacts/Release/Standalone/Stem Splitter.app/Contents/MacOS/Stem Splitter"
+          lipo -info "build/StemSplitter_artefacts/Release/VST3/Stem Splitter.vst3/Contents/MacOS/Stem Splitter"
+          lipo -info "build/StemSplitter_artefacts/Release/AU/Stem Splitter.component/Contents/MacOS/Stem Splitter"
+
+      - name: Validate Audio Unit
+        run: |
+          mkdir -p ~/Library/Audio/Plug-Ins/Components
+          cp -R "build/StemSplitter_artefacts/Release/AU/Stem Splitter.component" ~/Library/Audio/Plug-Ins/Components/
+          killall -9 AudioComponentRegistrar || true
+          auval -v aufx StSp Stsp
+
+      - name: Package
+        run: |
+          set -e
+          STAGE="dist/Stem Splitter"
+          mkdir -p "$STAGE/Plug-ins"
+          cp -R "build/StemSplitter_artefacts/Release/Standalone/Stem Splitter.app" "$STAGE/"
+          cp -R "build/StemSplitter_artefacts/Release/VST3/Stem Splitter.vst3" "$STAGE/Plug-ins/"
+          cp -R "build/StemSplitter_artefacts/Release/AU/Stem Splitter.component" "$STAGE/Plug-ins/"
+          cp build/stemsplit_artefacts/Release/stemsplit "$STAGE/Plug-ins/"
+          # Ad-hoc signature (no Apple Developer ID in CI): see README for first-launch instructions
+          codesign --force --deep --sign - "$STAGE/Stem Splitter.app"
+          codesign --force --deep --sign - "$STAGE/Plug-ins/Stem Splitter.vst3"
+          codesign --force --deep --sign - "$STAGE/Plug-ins/Stem Splitter.component"
+          ln -s /Applications "$STAGE/Applications"
+          cp docs/INSTALL.txt "$STAGE/Read Me.txt"
+          hdiutil create -volname "Stem Splitter" -srcfolder "$STAGE" -ov -format UDZO "dist/Stem-Splitter-macOS.dmg"
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Stem-Splitter-macOS
+          path: dist/Stem-Splitter-macOS.dmg
+          retention-days: 30
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/Stem-Splitter-macOS.dmg
+
+  linux:
+    name: Linux (engine + tests)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libasound2-dev libcurl4-openssl-dev libfreetype-dev \
+            libfontconfig1-dev libx11-dev libxcomposite-dev libxcursor-dev libxext-dev libxinerama-dev libxrandr-dev
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: deps-linux-${{ hashFiles('CMakeLists.txt', 'cmake/**') }}
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

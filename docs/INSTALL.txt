@@ -1,0 +1,38 @@
+STEM SPLITTER - INSTALLATION (macOS 11 or later, tested on macOS 14 Sonoma)
+==========================================================================
+
+1. Standalone app
+   Drag "Stem Splitter.app" onto the Applications folder.
+
+2. Plug-ins (optional, for use inside a DAW)
+   VST3:       copy "Plug-ins/Stem Splitter.vst3"      to  ~/Library/Audio/Plug-Ins/VST3
+   Audio Unit: copy "Plug-ins/Stem Splitter.component" to  ~/Library/Audio/Plug-Ins/Components
+   (In Finder press Cmd+Shift+G and paste the folder path.)
+
+3. First launch
+   This build is not notarised by Apple, so macOS will say it "cannot be opened". Either:
+     - Right-click (or Control-click) Stem Splitter.app, choose Open, then click Open, or
+     - open Terminal and run:
+         xattr -dr com.apple.quarantine "/Applications/Stem Splitter.app"
+   Do the same for the plug-ins if your DAW refuses to load them:
+         xattr -dr com.apple.quarantine ~/Library/Audio/Plug-Ins/VST3/"Stem Splitter.vst3"
+         xattr -dr com.apple.quarantine ~/Library/Audio/Plug-Ins/Components/"Stem Splitter.component"
+
+4. Models
+   The 4-stem and 6-stem neural networks are included inside the app. The plug-ins use the copies
+   inside /Applications/Stem Splitter.app, so install the app even if you only use the plug-ins.
+   The "4 Stems HQ" models (about 324 MB) download from inside the app the first time you pick them.
+
+QUICK START
+-----------
+  1. Drop a WAV file onto the window (or click to browse).
+  2. Pick an engine at the top (4 Stems, 6 Stems, 4 Stems HQ, Lite) and press "Separate".
+  3. Listen: mute (M) / solo (S) stems, set their levels, click a waveform to jump.
+  4. Export, in the panel on the right:
+       Stems       - one WAV per selected stem.
+       Custom mix  - one WAV of what you hear: click instruments to remove them (e.g. "Instrumental"),
+                     and/or switch on "Remove frequencies" to cut a low, high or band of frequencies.
+  You can also drag a stem's handle (the dots on the right of each lane) straight into Finder or a DAW.
+
+Keyboard: Space play/pause, Return back to start, L loop, Left/Right skip 5 s,
+          Cmd+O open, Cmd+E export, Esc cancel.
