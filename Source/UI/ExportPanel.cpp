@@ -261,8 +261,12 @@ juce::String ExportPanel::getSummary() const
                             + " - " + getStemName (stems->stems.front().type) + ".wav\"";
     }
 
-    return "\"" + source->file.getFileNameWithoutExtension() + " ("
-           + MixRenderer::describeMix (stems.get(), processor.getMix(), true) + ").wav\"";
+    auto description = MixRenderer::describeMix (stems.get(), processor.getMix(), true);
+
+    if (processor.isCleanupActive())
+        description = description == "Mix" ? juce::String ("Cleaned") : description + " + Cleaned";
+
+    return "\"" + source->file.getFileNameWithoutExtension() + " (" + description + ").wav\"";
 }
 
 void ExportPanel::refresh()
@@ -341,6 +345,11 @@ void ExportPanel::refresh()
 
     if (busy)
         label = "Exporting " + juce::String (juce::roundToInt (busyProgress * 100.0f)) + "%";
+    else if (! processor.isCleanupUpToDate() && source != nullptr)
+    {
+        label = "Applying clean-up...";
+        canExport = false;
+    }
 
     exportButton.setButtonText (label);
     exportButton.setEnabled (canExport);
@@ -357,7 +366,7 @@ void ExportPanel::resized()
     const auto stems = processor.getStems();
     const bool hasStems = stems != nullptr && ! stems->stems.empty();
 
-    r.removeFromTop (headerHeight + 10);   // "EXPORT" title
+    r.removeFromTop (4);
     modeSelector.setBounds (r.removeFromTop (34));
     r.removeFromTop (14);
 
@@ -455,11 +464,6 @@ void ExportPanel::paint (juce::Graphics& g)
     using namespace Theme::Colours;
     g.setColour (panel);
     g.fillRect (getLocalBounds());
-    g.setColour (outlineSoft);
-    g.fillRect (0, 0, 1, getHeight());
-
-    auto r = getLocalBounds().reduced (20, 18);
-    Theme::drawLabel (g, "Export", r.removeFromTop (headerHeight), textDim, 11.5f);
 
     const auto& prefs = processor.getExportPreferences();
     const auto stems = processor.getStems();

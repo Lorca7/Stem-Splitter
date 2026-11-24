@@ -3,13 +3,17 @@
 //   stemsplit song.wav                          → song - Vocals.wav, song - Drums.wav, ...
 //   stemsplit --engine 6 song.wav               → six stems (adds guitar + piano)
 //   stemsplit --remove vocals song.wav          → song (No Vocals).wav
-//   stemsplit --cut band:250-4000 song.wav      → song (Band Cut 250 Hz-4 kHz).wav (no separation)
+//   stemsplit --cut band:250-4000 song.wav      → song (Band Cut 250 Hz to 4 kHz).wav (no separation)
+//   stemsplit --denoise 18 --dehum auto take.wav → take (Cleaned).wav (no separation)
+//   stemsplit --analyse take.wav                → reports noise floor, hum and tones
 //   stemsplit --selftest                        → runs the built-in DSP checks
 
 #include "Core/MixRenderer.h"
+#include "Core/NoiseCleanup.h"
 #include "Core/ModelManager.h"
 #include "Core/SeparationJob.h"
 
+#include <algorithm>
 #include <iostream>
 
 using namespace stemsplitter;
@@ -35,7 +39,8 @@ namespace
 
     bool isOptionValue (const juce::ArgumentList& args, int index)
     {
-        static const juce::StringArray valued { "--engine", "--out", "--stems", "--remove", "--cut", "--bits", "--rate", "--threads" };
+        static const juce::StringArray valued { "--engine", "--out", "--stems", "--remove", "--cut", "--bits", "--rate", "--threads",
+                                                "--denoise", "--sensitivity", "--dehum", "--notch", "--rumble", "--learn-noise" };
         return index > 0 && valued.contains (args[index - 1].text);
     }
 
@@ -50,6 +55,15 @@ Options:
   --stems <list>           Only export these stems, e.g. vocals,drums
   --remove <list>          Export ONE file with these stems removed, e.g. vocals
   --cut <spec>             Frequency cut for the mix: low:<hz> | high:<hz> | band:<lo>-<hi>
+
+Clean-up (applied to the original and to every stem):
+  --denoise <dB>           Reduce steady background noise (fans, AC, hiss) by this much, e.g. 15
+  --sensitivity <0..1>     How aggressively quiet detail is treated as noise (default 0.5)
+  --learn-noise <a-b>      Learn the noise from seconds a to b (default: automatic)
+  --dehum <auto|50|60>     Remove mains hum and its harmonics
+  --notch <hz,hz,...>      Remove specific tones (fan whine, buzz)
+  --rumble <hz>            Remove rumble below this frequency
+  --analyse                Show the noise floor, detected hum and suggested tones, then exit
   --bits <16|24|32>        Output bit depth (default 24; 32 = float)
   --rate <hz>              Output sample rate (default: same as input)
   --threads <n>            Worker threads (default: automatic)
@@ -226,7 +240,124 @@ Options:
                 return fail ("disabled frequency cut must not alter the audio");
         }
 
-        // 4. WAV round trip at each bit depth
+        // 4. Clean-up: hum, steady noise, a fan whine and rumble
+        {
+            const double sr = 48000.0;
+            const int n = (int) (sr * 8.0);
+            const double twoPi = juce::MathConstants<double>::pi * 2.0;
+            juce::AudioBuffer<float> music (2, n), noisy (2, n);
+            juce::Random rng (99);
+
+            for (int i = 0; i < n; ++i)
+            {
+                const double t = i / sr;
+                // music: a 440 Hz note that comes and goes (on for 1 s, off for 1 s)
+                const float note = ((int) t % 2 == 0) ? 0.3f * (float) std::sin (twoPi * 440.0 * t) : 0.0f;
+                // 60 Hz hum with harmonics, a 2.2 kHz fan whine, broadband hiss and 18 Hz rumble
+                float hum = 0.0f;
+                for (int h = 1; h <= 4; ++h)
+                    hum += 0.02f / (float) h * (float) std::sin (twoPi * 60.0 * h * t);
+                const float whine = 0.006f * (float) std::sin (twoPi * 2200.0 * t);
+                const float rumble = 0.05f * (float) std::sin (twoPi * 18.0 * t);
+
+                for (int ch = 0; ch < 2; ++ch)
+                {
+                    const float hiss = 0.003f * (rng.nextFloat() * 2.0f - 1.0f);
+                    music.setSample (ch, i, note);
+                    noisy.setSample (ch, i, note + hum + whine + rumble + hiss);
+                }
+            }
+
+            auto tone = [sr] (const juce::AudioBuffer<float>& b, double hz, int start, int len)
+            {
+                double re = 0, im = 0;
+                for (int i = start; i < start + len; ++i)
+                {
+                    re += b.getSample (0, i) * std::cos (2.0 * juce::MathConstants<double>::pi * hz * i / sr);
+                    im += b.getSample (0, i) * std::sin (2.0 * juce::MathConstants<double>::pi * hz * i / sr);
+                }
+                return 2.0 * std::sqrt (re * re + im * im) / len;
+            };
+
+            const auto analysis = NoiseCleanup::analyse (noisy, sr);
+            std::cout << "  clean-up: detected hum " << analysis.detectedHumHz << " Hz, tones:";
+            for (auto hz : analysis.suggestedTonesHz)
+                std::cout << " " << juce::String (hz, 1);
+            std::cout << std::endl;
+
+            if (! juce::approximatelyEqual (analysis.detectedHumHz, 60.0f))
+                return fail ("hum detection");
+
+            const bool foundWhine = std::any_of (analysis.suggestedTonesHz.begin(), analysis.suggestedTonesHz.end(),
+                                                 [] (float hz) { return std::abs (hz - 2200.0f) < 5.0f; });
+            const bool flaggedMusic = std::any_of (analysis.suggestedTonesHz.begin(), analysis.suggestedTonesHz.end(),
+                                                   [] (float hz) { return std::abs (hz - 440.0f) < 10.0f; });
+            if (! foundWhine || flaggedMusic)
+                return fail ("tone detection should find the 2.2 kHz whine and leave the 440 Hz note alone");
+
+            if (std::abs (NoiseCleanup::snapToPeak (analysis, 2150.0f) - 2200.0f) > 3.0f)
+                return fail ("snapping a click to the whine peak");
+
+            CleanupSettings c;
+            c.enabled = true;
+            c.denoise = true;
+            c.reductionDb = 24.0f;
+            c.dehum = true;
+            c.notchesHz = { NoiseCleanup::snapToPeak (analysis, 2200.0f) };
+            c.rumble = true;
+            c.rumbleHz = 40.0f;
+
+            const auto cleaned = NoiseCleanup::process (noisy, sr, c, analysis.autoProfile, NoiseCleanup::resolveHumHz (c, analysis));
+
+            const int on = (int) sr / 2, off = (int) (sr * 1.25), len = (int) (sr * 0.5);   // inside a note / inside a gap
+            auto reportDb = [] (double a, double b) { return juce::Decibels::gainToDecibels ((float) (b / a)); };
+
+            const double humCut = reportDb (tone (noisy, 60, off, len), tone (cleaned, 60, off, len));
+            const double harmonicCut = reportDb (tone (noisy, 180, off, len), tone (cleaned, 180, off, len));
+            const double whineCut = reportDb (tone (noisy, 2200, off, len), tone (cleaned, 2200, off, len));
+            const double rumbleCut = reportDb (tone (noisy, 18, 0, (int) sr * 4), tone (cleaned, 18, 0, (int) sr * 4));
+            const double noteChange = reportDb (tone (noisy, 440, on, len), tone (cleaned, 440, on, len));
+
+            juce::AudioBuffer<float> gapBefore (1, len), gapAfter (1, len), gapMusic (1, len);
+            gapBefore.copyFrom (0, 0, noisy, 0, off, len);
+            gapAfter.copyFrom (0, 0, cleaned, 0, off, len);
+            const double floorCut = juce::Decibels::gainToDecibels ((float) (rms (gapAfter) / rms (gapBefore)));
+
+            // Zero phase: in the middle of a note the cleaned signal lines up with the clean music
+            juce::AudioBuffer<float> a (1, len), b (1, len);
+            a.copyFrom (0, 0, music, 0, on, len);
+            b.copyFrom (0, 0, cleaned, 0, on, len);
+            const double alignmentErr = juce::Decibels::gainToDecibels ((float) (rmsDifference (a, b) / rms (a)));
+
+            std::cout << "  clean-up: hum " << humCut << " dB, 3rd harmonic " << harmonicCut << " dB, whine " << whineCut
+                      << " dB, rumble " << rumbleCut << " dB, noise in gaps " << floorCut << " dB, note " << noteChange
+                      << " dB, residual vs clean music " << alignmentErr << " dB" << std::endl;
+
+            if (humCut > -30 || harmonicCut > -30 || whineCut > -30 || rumbleCut > -20 || floorCut > -15
+                || std::abs (noteChange) > 0.5 || alignmentErr > -25)
+                return fail ("clean-up");
+
+            CleanupSettings off2 = c;
+            off2.enabled = false;
+            if (rmsDifference (NoiseCleanup::process (noisy, sr, off2, analysis.autoProfile, 60.0f), noisy) > 0.0)
+                return fail ("disabled clean-up must not alter the audio");
+
+            // A learned profile (from a gap) works as well as the automatic one
+            const auto learned = NoiseCleanup::learnProfile (noisy, sr, (int) (sr * 1.1), (int) (sr * 0.8));
+            CleanupSettings onlyDenoise;
+            onlyDenoise.enabled = true;
+            onlyDenoise.reductionDb = 24.0f;
+            const auto denoised = NoiseCleanup::process (noisy, sr, onlyDenoise, learned, 60.0f);
+            gapAfter.copyFrom (0, 0, denoised, 0, (int) (sr * 3.25), len);
+            gapBefore.copyFrom (0, 0, noisy, 0, (int) (sr * 3.25), len);
+            const double learnedCut = juce::Decibels::gainToDecibels ((float) (rms (gapAfter) / rms (gapBefore)));
+            std::cout << "  clean-up: learned profile reduces the gaps by " << learnedCut << " dB" << std::endl;
+
+            if (! learned.learnedFromSelection || learnedCut > -15)
+                return fail ("learned noise profile");
+        }
+
+        // 5. WAV round trip at each bit depth
         {
             const auto dir = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("stemsplit-selftest");
             dir.createDirectory();
@@ -370,10 +501,65 @@ int main (int argc, char* argv[])
     std::cout << input.getFileName() << ": " << source->getLengthSeconds() << " s, " << source->sampleRate << " Hz, "
               << source->originalNumChannels << " ch, " << source->bitsPerSample << "-bit" << std::endl;
 
-    const bool frequencyCutOnly = removed.isEmpty() && mix.cut.enabled;
+    // Clean-up options
+    CleanupSettings cleanup;
+    const auto denoiseArg = optionValue (args, "--denoise");
+    const auto dehumArg = optionValue (args, "--dehum").toLowerCase();
+    const auto notchArg = optionValue (args, "--notch");
+    const auto rumbleArg = optionValue (args, "--rumble");
+
+    cleanup.denoise = denoiseArg.isNotEmpty();
+    cleanup.reductionDb = denoiseArg.isNotEmpty() ? juce::jlimit (3.0f, 40.0f, denoiseArg.getFloatValue()) : 15.0f;
+    if (args.containsOption ("--sensitivity"))
+        cleanup.sensitivity = juce::jlimit (0.0f, 1.0f, optionValue (args, "--sensitivity").getFloatValue());
+    cleanup.dehum = dehumArg.isNotEmpty();
+    cleanup.humHz = dehumArg == "50" ? 50 : dehumArg == "60" ? 60 : 0;
+    for (auto& t : juce::StringArray::fromTokens (notchArg, ",", ""))
+        if (t.getFloatValue() > 0.0f)
+            cleanup.notchesHz.push_back (t.getFloatValue());
+    cleanup.rumble = rumbleArg.isNotEmpty();
+    if (cleanup.rumble)
+        cleanup.rumbleHz = juce::jlimit (20.0f, 200.0f, rumbleArg.getFloatValue());
+    cleanup.enabled = cleanup.denoise || cleanup.dehum || ! cleanup.notchesHz.empty() || cleanup.rumble;
+
+    CleanupAnalysis analysis;
+    NoiseProfile profile;
+
+    if (cleanup.enabled || args.containsOption ("--analyse|--analyze"))
+    {
+        analysis = NoiseCleanup::analyse (source->buffer, source->sampleRate);
+        profile = analysis.autoProfile;
+
+        const auto learnArg = optionValue (args, "--learn-noise");
+
+        if (learnArg.isNotEmpty())
+        {
+            const double a0 = learnArg.upToFirstOccurrenceOf ("-", false, false).getDoubleValue();
+            const double a1 = learnArg.fromFirstOccurrenceOf ("-", false, false).getDoubleValue();
+            profile = NoiseCleanup::learnProfile (source->buffer, source->sampleRate, (int) (a0 * source->sampleRate),
+                                                  (int) ((a1 - a0) * source->sampleRate));
+        }
+
+        if (args.containsOption ("--analyse|--analyze"))
+        {
+            std::cout << "Detected mains hum: " << (analysis.detectedHumHz > 0 ? juce::String (analysis.detectedHumHz) + " Hz" : juce::String ("none")) << std::endl;
+            std::cout << "Suggested tones to notch:";
+            for (auto hz : analysis.suggestedTonesHz)
+                std::cout << " " << juce::String (hz, 1) << " Hz";
+            std::cout << (analysis.suggestedTonesHz.empty() ? " none" : "") << std::endl;
+            std::cout << "Noise floor (dBFS):";
+            for (float hz : { 50.0f, 100.0f, 500.0f, 1000.0f, 4000.0f, 10000.0f })
+                std::cout << "  " << hz << " Hz " << juce::String (CleanupAnalysis::valueAt (analysis.floorDb, analysis.displayFftSize, analysis.sampleRate, hz), 1);
+            std::cout << std::endl;
+            return 0;
+        }
+    }
+
+    const bool wantsStems = args.containsOption ("--engine") || args.containsOption ("--stems");
+    const bool noSeparation = removed.isEmpty() && (mix.cut.enabled || cleanup.enabled) && ! wantsStems;
     StemSet stems;
 
-    if (! frequencyCutOnly)
+    if (! noSeparation)
     {
         if (! ModelManager::isInstalled (engine))
             return fail ("The " + getEngineName (engine) + " model isn't installed. Run with --list-models for details.");
@@ -403,7 +589,21 @@ int main (int argc, char* argv[])
                   << source->getLengthSeconds() / juce::jmax (0.001, stems.secondsTaken) << "x real time)" << std::endl;
     }
 
-    if (removed.isEmpty() && ! mix.cut.enabled)
+    // Clean-up is applied to the original and to every stem
+    if (cleanup.enabled)
+    {
+        const auto t0 = juce::Time::getMillisecondCounterHiRes();
+        const float humHz = NoiseCleanup::resolveHumHz (cleanup, analysis);
+        source->buffer = NoiseCleanup::process (source->buffer, source->sampleRate, cleanup, profile, humHz);
+
+        for (auto& s : stems.stems)
+            s.buffer = NoiseCleanup::process (s.buffer, source->sampleRate, cleanup, profile, humHz);
+
+        std::cout << "Cleaned up (" << cleanup.describe (humHz) << ") in "
+                  << juce::String ((juce::Time::getMillisecondCounterHiRes() - t0) / 1000.0, 2) << " s" << std::endl;
+    }
+
+    if (removed.isEmpty() && ! noSeparation && ! mix.cut.enabled)
     {
         if (selected.isEmpty())
             for (auto& s : stems.stems)
@@ -423,9 +623,13 @@ int main (int argc, char* argv[])
         for (auto t : removed)
             mix.stems[(size_t) toIndex (t)].muted = true;
 
-        const auto* stemSet = frequencyCutOnly ? nullptr : &stems;
-        const auto name = AudioIO::makeSafeFileName (input.getFileNameWithoutExtension()
-                                                     + " (" + MixRenderer::describeMix (stemSet, mix, true) + ").wav");
+        const auto* stemSet = noSeparation ? nullptr : &stems;
+        auto description = MixRenderer::describeMix (stemSet, mix, true);
+
+        if (cleanup.enabled)
+            description = description == "Mix" ? juce::String ("Cleaned") : description + " + Cleaned";
+
+        const auto name = AudioIO::makeSafeFileName (input.getFileNameWithoutExtension() + " (" + description + ").wav");
         const auto file = AudioIO::getNonexistentSibling (outDir.getChildFile (name));
 
         r = MixRenderer::exportMix (*source, stemSet, mix, file, exportOptions);

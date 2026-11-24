@@ -43,10 +43,12 @@ include(cmake/Demucs.cmake)
 # Shared engine sources (compiled into both the plug-in and the CLI)
 set(STEMSPLITTER_CORE_SOURCES
     Source/Core/AudioIO.cpp
+    Source/Core/CleanupEngine.cpp
     Source/Core/DemucsSeparator.cpp
     Source/Core/FrequencyCut.cpp
     Source/Core/MixRenderer.cpp
     Source/Core/ModelManager.cpp
+    Source/Core/NoiseCleanup.cpp
     Source/Core/SeparationJob.cpp
     Source/Core/SpectralSeparator.cpp
     Source/Core/WaveformPeaks.cpp)
@@ -54,12 +56,14 @@ set(STEMSPLITTER_CORE_SOURCES
 set(STEMSPLITTER_UI_SOURCES
     Source/PluginProcessor.cpp
     Source/PluginEditor.cpp
+    Source/UI/CleanupPanel.cpp
     Source/UI/DropZone.cpp
     Source/UI/ExportPanel.cpp
     Source/UI/FrequencyCutView.cpp
     Source/UI/HeaderBar.cpp
     Source/UI/Icons.cpp
     Source/UI/ModelOverlay.cpp
+    Source/UI/SpectrumView.cpp
     Source/UI/StemLane.cpp
     Source/UI/Theme.cpp
     Source/UI/TransportBar.cpp)

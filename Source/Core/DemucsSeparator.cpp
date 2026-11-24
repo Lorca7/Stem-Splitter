@@ -88,17 +88,14 @@ namespace
     };
 
     //==========================================================================
-    struct Chunk
-    {
-        int coreStart = 0, coreEnd = 0;   // region this chunk is responsible for
-        int segStart = 0, segEnd = 0;     // region actually processed (core + context)
-        bool hasPrev = false, hasNext = false;
-    };
+    /** Runs one Demucs model over the whole input.
 
-    /** Runs one Demucs model over the whole input, split into overlapping chunks that are
-        processed in parallel and cross-faded back together.
+        This mirrors demucs.cpp's own split_inference (7.8 s segments, 25% overlap, triangular
+        cross-fades) but processes the segments in parallel, one worker per core, each with its own
+        working buffers. Compared with splitting the song into chunks and running the full pipeline on
+        each, this avoids redundant context and padding: the network only sees ~1.33x the song length.
 
-        Returns a tensor-like set of buffers: one stereo buffer per model output. */
+        Returns one stereo buffer per model output. */
     std::vector<juce::AudioBuffer<float>> runModelThreaded (const demucscpp::demucs_model& model,
                                                             const juce::AudioBuffer<float>& input,
                                                             SeparationContext& context,
@@ -107,37 +104,8 @@ namespace
     {
         const int total = input.getNumSamples();
         const int numSources = model.is_4sources ? 4 : 6;
-        const int sr = (int) engineSampleRate;
-
-        // Split into chunks: enough to keep every thread busy, but no longer than 30 s each so
-        // memory stays bounded and progress is smooth. Each chunk gets 2 s of context per side.
-        const int numThreads = juce::jmax (1, context.numThreads);
-        const int contextLen = 2 * sr;
-        const int minCore = 8 * sr, maxCore = 30 * sr;
-        const int coreLen = juce::jlimit (minCore, maxCore, (total + numThreads - 1) / numThreads);
-
-        std::vector<Chunk> chunks;
-
-        for (int start = 0; start < total; start += coreLen)
-        {
-            Chunk c;
-            c.coreStart = start;
-            c.coreEnd = juce::jmin (total, start + coreLen);
-            c.hasPrev = start > 0;
-            c.hasNext = c.coreEnd < total;
-            c.segStart = c.hasPrev ? juce::jmax (0, c.coreStart - contextLen) : 0;
-            c.segEnd = c.hasNext ? juce::jmin (total, c.coreEnd + contextLen) : total;
-            chunks.push_back (c);
-        }
-
-        // Merge a very short tail into its predecessor (Demucs needs some audio to work with).
-        if (chunks.size() > 1 && chunks.back().coreEnd - chunks.back().coreStart < 2 * sr)
-        {
-            chunks[chunks.size() - 2].coreEnd = total;
-            chunks[chunks.size() - 2].segEnd = total;
-            chunks[chunks.size() - 2].hasNext = false;
-            chunks.pop_back();
-        }
+        const int segment = (int) (demucscpp::SEGMENT_LEN_SECS * demucscpp::SUPPORTED_SAMPLE_RATE);
+        const int stride = (int) ((1.0f - demucscpp::OVERLAP) * (float) segment);
 
         std::vector<juce::AudioBuffer<float>> outputs;
 
@@ -147,12 +115,49 @@ namespace
             outputs.back().clear();
         }
 
-        std::vector<std::atomic<float>> chunkProgress (chunks.size());
-        for (auto& p : chunkProgress)
+        // Normalise like Demucs: by the mean and standard deviation of the mono mix, over the whole song.
+        double sum = 0.0, sumSq = 0.0;
+        const float* l = input.getReadPointer (0);
+        const float* r = input.getReadPointer (1);
+
+        for (int i = 0; i < total; ++i)
+        {
+            const double m = 0.5 * ((double) l[i] + (double) r[i]);
+            sum += m;
+            sumSq += m * m;
+        }
+
+        const double mean = sum / juce::jmax (1, total);
+        const double variance = total > 1 ? (sumSq - (double) total * mean * mean) / (double) (total - 1) : 0.0;
+        const float refMean = (float) mean;
+        const float refStd = (float) std::sqrt (juce::jmax (0.0, variance));
+
+        if (refStd < 1.0e-7f)   // digital silence separates into silence
+        {
+            context.reportProgress (progressStart + progressSpan, stageName);
+            return outputs;
+        }
+
+        // Triangular transition window, as demucs.cpp (TRANSITION_POWER = 1)
+        std::vector<float> weight ((size_t) segment, 0.0f);
+
+        for (int i = 0; i < segment / 2; ++i)
+        {
+            weight[(size_t) i] = (float) (i + 1) / (float) (segment / 2);
+            weight[(size_t) (segment - 1 - i)] = weight[(size_t) i];
+        }
+
+        std::vector<int> offsets;
+        for (int offset = 0; offset < total; offset += stride)
+            offsets.push_back (offset);
+
+        std::vector<float> sumWeight ((size_t) total, 0.0f);
+        std::vector<std::atomic<float>> segmentProgress (offsets.size());
+        for (auto& p : segmentProgress)
             p = 0.0f;
 
-        std::atomic<size_t> nextChunk { 0 };
-        std::atomic<bool> failed { false };
+        std::atomic<size_t> next { 0 };
+        std::atomic<bool> stop { false };
         std::mutex accumulateLock, progressLock;
         juce::String errorMessage;
         bool cancelled = false;
@@ -160,104 +165,76 @@ namespace
         auto reportOverall = [&]
         {
             double done = 0.0;
-
-            for (size_t i = 0; i < chunks.size(); ++i)
-                done += (double) chunkProgress[i].load() * (chunks[i].coreEnd - chunks[i].coreStart);
+            for (auto& p : segmentProgress)
+                done += p.load();
 
             const std::lock_guard<std::mutex> lock (progressLock);
-            context.reportProgress (progressStart + progressSpan * (float) (done / juce::jmax (1, total)), stageName);
+            context.reportProgress (progressStart + progressSpan * (float) (done / (double) offsets.size()), stageName);
         };
 
         auto worker = [&]
         {
+            std::unique_ptr<demucscpp::demucs_segment_buffers> buffers;
+            std::unique_ptr<demucscpp::stft_buffers> stft;
+
+            try
+            {
+                buffers = std::make_unique<demucscpp::demucs_segment_buffers> (2, segment, numSources);
+                stft = std::make_unique<demucscpp::stft_buffers> (buffers->padded_segment_samples);
+            }
+            catch (const std::bad_alloc&)
+            {
+                stop = true;
+                const std::lock_guard<std::mutex> lock (accumulateLock);
+                errorMessage = "Not enough memory to separate this file. Close other apps and try again.";
+                return;
+            }
+
             for (;;)
             {
-                const size_t index = nextChunk.fetch_add (1);
+                const size_t index = next.fetch_add (1);
 
-                if (index >= chunks.size() || failed.load())
+                if (index >= offsets.size() || stop.load())
                     return;
 
-                const auto& c = chunks[index];
-                const int segLen = c.segEnd - c.segStart;
+                const int offset = offsets[index];
+                const int length = juce::jmin (segment, total - offset);
+                const int leftPad = (segment - length) / 2;   // symmetric zero padding, as demucs.cpp
 
-                Eigen::MatrixXf segment (2, segLen);
-                float peak = 0.0f;
+                buffers->mix.setZero();
 
-                for (int ch = 0; ch < 2; ++ch)
+                for (int i = 0; i < length; ++i)
                 {
-                    const float* src = input.getReadPointer (ch, c.segStart);
-
-                    for (int i = 0; i < segLen; ++i)
-                    {
-                        segment (ch, i) = src[i];
-                        peak = juce::jmax (peak, std::abs (src[i]));
-                    }
+                    buffers->mix (0, leftPad + i) = (l[offset + i] - refMean) / refStd;
+                    buffers->mix (1, leftPad + i) = (r[offset + i] - refMean) / refStd;
                 }
-
-                // Demucs normalises by the signal's standard deviation, so pure digital silence
-                // would produce NaNs. Silence separates into silence anyway.
-                if (peak < 1.0e-6f)
-                {
-                    chunkProgress[index] = 1.0f;
-                    reportOverall();
-                    continue;
-                }
-
-                Eigen::Tensor3dXf result;
 
                 try
                 {
                     demucscpp::ProgressCallback cb = [&, index] (float p, const std::string&)
                     {
-                        if (context.shouldCancel() || failed.load())
+                        if (stop.load() || context.shouldCancel())
                             throw SeparationCancelled();
 
-                        chunkProgress[index] = juce::jlimit (0.0f, 1.0f, p);
+                        segmentProgress[index] = juce::jlimit (0.0f, 1.0f, p);
                         reportOverall();
                     };
 
-                    result = demucscpp::demucs_inference (model, segment, cb);
+                    demucscpp::model_inference (model, *buffers, *stft, cb, 0.0f, 1.0f);
                 }
                 catch (const SeparationCancelled&)
                 {
-                    failed = true;
+                    stop = true;
                     const std::lock_guard<std::mutex> lock (accumulateLock);
                     cancelled = true;
                     return;
                 }
                 catch (const std::exception& e)
                 {
-                    failed = true;
+                    stop = true;
                     const std::lock_guard<std::mutex> lock (accumulateLock);
                     errorMessage = "The separation engine failed: " + juce::String (e.what());
                     return;
-                }
-
-                if (result.dimension (0) < numSources || result.dimension (2) < segLen)
-                {
-                    failed = true;
-                    const std::lock_guard<std::mutex> lock (accumulateLock);
-                    errorMessage = "The separation engine returned unexpected output.";
-                    return;
-                }
-
-                // Linear cross-fade across the shared context regions: weights of neighbouring
-                // chunks sum to exactly 1 everywhere.
-                const float fadeLen = (float) (2 * contextLen);
-                std::vector<float> weights ((size_t) segLen, 1.0f);
-
-                for (int i = 0; i < segLen; ++i)
-                {
-                    const int t = c.segStart + i;
-                    float w = 1.0f;
-
-                    if (c.hasPrev)
-                        w = juce::jmin (w, juce::jlimit (0.0f, 1.0f, (float) (t - (c.coreStart - contextLen)) / fadeLen));
-
-                    if (c.hasNext)
-                        w = juce::jmin (w, juce::jlimit (0.0f, 1.0f, (float) ((c.coreEnd + contextLen) - t) / fadeLen));
-
-                    weights[(size_t) i] = w;
                 }
 
                 {
@@ -267,23 +244,26 @@ namespace
                     {
                         for (int ch = 0; ch < 2; ++ch)
                         {
-                            float* dst = outputs[(size_t) s].getWritePointer (ch, c.segStart);
+                            float* dst = outputs[(size_t) s].getWritePointer (ch, offset);
 
-                            for (int i = 0; i < segLen; ++i)
+                            for (int i = 0; i < length; ++i)
                             {
-                                const float v = result (s, ch, i);
-                                dst[i] += std::isfinite (v) ? v * weights[(size_t) i] : 0.0f;
+                                const float v = buffers->targets_out (s, ch, leftPad + i);
+                                dst[i] += std::isfinite (v) ? weight[(size_t) i] * v : 0.0f;
                             }
                         }
                     }
+
+                    for (int i = 0; i < length; ++i)
+                        sumWeight[(size_t) (offset + i)] += weight[(size_t) i];
                 }
 
-                chunkProgress[index] = 1.0f;
+                segmentProgress[index] = 1.0f;
                 reportOverall();
             }
         };
 
-        const int numWorkers = juce::jmin (numThreads, (int) chunks.size());
+        const int numWorkers = juce::jlimit (1, juce::jmax (1, (int) offsets.size()), context.numThreads);
         std::vector<std::thread> threads;
 
         for (int i = 1; i < numWorkers; ++i)
@@ -299,6 +279,16 @@ namespace
 
         if (errorMessage.isNotEmpty())
             throw std::runtime_error (errorMessage.toStdString());
+
+        // Undo the weighting and the normalisation
+        for (auto& out : outputs)
+            for (int ch = 0; ch < 2; ++ch)
+            {
+                float* d = out.getWritePointer (ch);
+
+                for (int i = 0; i < total; ++i)
+                    d[i] = sumWeight[(size_t) i] > 0.0f ? d[i] / sumWeight[(size_t) i] * refStd + refMean : 0.0f;
+            }
 
         return outputs;
     }

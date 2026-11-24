@@ -148,7 +148,7 @@ private:
 
 //==============================================================================
 StemSplitterEditor::StemSplitterEditor (StemSplitterProcessor& p)
-    : AudioProcessorEditor (p), proc (p), header (p), transport (p), exportPanel (p), modelOverlay (p)
+    : AudioProcessorEditor (p), proc (p), header (p), transport (p), cleanupPanel (p), exportPanel (p), modelOverlay (p)
 {
     setLookAndFeel (&lookAndFeel);
     setOpaque (true);
@@ -156,7 +156,13 @@ StemSplitterEditor::StemSplitterEditor (StemSplitterProcessor& p)
 
     addAndMakeVisible (header);
     addAndMakeVisible (transport);
+    sideTabs.setOptions ({ "Clean up", "Export" },
+                         { "Remove background noise, hum, tones and rumble", "Export stems or a custom mix" });
+    sideTabs.onChange = [this] (int i) { showSideTab (i); };
+    addAndMakeVisible (sideTabs);
+    addChildComponent (cleanupPanel);
     addAndMakeVisible (exportPanel);
+    sideTabs.setSelectedIndex (1, juce::dontSendNotification);
     addAndMakeVisible (dropZone);
 
     header.onOpenFile = [this] { openFileChooser(); };
@@ -199,6 +205,7 @@ StemSplitterEditor::StemSplitterEditor (StemSplitterProcessor& p)
     setResizeLimits (980, 640, 3000, 2000);
     setSize (1180, 760);
 
+    showSideTab (1);
     refreshAll();
     startTimerHz (30);
 }
@@ -236,7 +243,12 @@ void StemSplitterEditor::resized()
     auto r = getLocalBounds();
     header.setBounds (r.removeFromTop (headerHeight));
     transport.setBounds (r.removeFromBottom (transportHeight));
-    exportPanel.setBounds (r.removeFromRight (exportPanelWidth));
+    auto side = r.removeFromRight (exportPanelWidth);
+    sideTabArea = side.removeFromTop (58);
+    sideTabs.setBounds (sideTabArea.reduced (20, 0).withTrimmedTop (16).withHeight (34));
+    side.removeFromTop (4);
+    cleanupPanel.setBounds (side);
+    exportPanel.setBounds (side);
 
     auto main = getMainArea();
     dropZone.setBounds (main);
@@ -263,6 +275,12 @@ void StemSplitterEditor::paint (juce::Graphics& g)
 {
     using namespace Theme::Colours;
     g.fillAll (background);
+
+    // right-hand column behind the tabs
+    g.setColour (panel);
+    g.fillRect (sideTabArea.withHeight (sideTabArea.getHeight() + 4));
+    g.setColour (outlineSoft);
+    g.fillRect (sideTabArea.getX(), sideTabArea.getY(), 1, getHeight() - sideTabArea.getY() - transportHeight);
 
     const auto source = proc.getSource();
 
@@ -360,9 +378,32 @@ void StemSplitterEditor::refreshAll()
     transport.update();
     modelOverlay.refresh();
 
+    cleanupPanel.refresh();
     rebuildLanesIfNeeded();
+    syncWaveforms();
     updateLaneStates();
+    updateTimerRate();
     repaint();
+}
+
+void StemSplitterEditor::showSideTab (int index)
+{
+    cleanupPanel.setVisible (index == 0);
+    exportPanel.setVisible (index == 1);
+    sideTabs.setSelectedIndex (index, juce::dontSendNotification);
+}
+
+void StemSplitterEditor::updateTimerRate()
+{
+    // Only animate quickly while something is moving; otherwise tick slowly to save CPU.
+    const auto& cleanupEngine = proc.getCleanupEngine();
+    const bool busy = proc.isPlaying() || proc.isSeparating() || proc.isLoadingFile()
+                      || proc.getDownloader().isDownloading() || cleanupEngine.isRendering() || cleanupEngine.isAnalysing()
+                      || (exportThread != nullptr && ! exportThread->finished.load());
+    const int hz = busy ? 30 : 4;
+
+    if (getTimerInterval() != 1000 / hz)
+        startTimerHz (hz);
 }
 
 void StemSplitterEditor::rebuildLanesIfNeeded()
@@ -387,23 +428,16 @@ void StemSplitterEditor::rebuildLanesIfNeeded()
         return;
 
     originalLane = std::make_unique<StemLane> (std::nullopt);
-    originalLane->setWaveform (&proc.getSourcePeaks());
     originalLane->onSeek = [this] (double f) { seekToFraction (f); };
     laneContainer.addAndMakeVisible (*originalLane);
 
     for (auto type : displayOrder)
     {
         const StemAudio* stem = nullptr;
-        const WaveformPeaks* peaks = nullptr;
 
         if (stems != nullptr)
         {
-            for (size_t i = 0; i < stems->stems.size(); ++i)
-                if (stems->stems[i].type == type)
-                {
-                    stem = &stems->stems[i];
-                    peaks = &stems->peaks[i];
-                }
+            stem = stems->find (type);
 
             if (stem == nullptr)
                 continue;
@@ -420,9 +454,6 @@ void StemSplitterEditor::rebuildLanesIfNeeded()
                                            : juce::String());
         lane->setShowExportToggle (false);
 
-        if (peaks != nullptr)
-            lane->setWaveform (peaks);
-
         lane->onMute = [this, type] (bool m) { proc.setStemMuted (type, m); };
         lane->onSolo = [this, type] (bool s) { proc.setStemSolo (type, s); };
         lane->onGain = [this, type] (float db) { proc.setStemGain (type, db); };
@@ -432,6 +463,29 @@ void StemSplitterEditor::rebuildLanesIfNeeded()
     }
 
     layoutLanes();
+}
+
+void StemSplitterEditor::syncWaveforms()
+{
+    // Show what you hear: the cleaned audio when clean-up is on. These shared pointers keep the
+    // drawn data alive until the next sync.
+    shownSourcePeaks = proc.getPlaybackSourcePeaks();
+    shownPlaybackStems = proc.getPlaybackStems();
+
+    if (originalLane != nullptr)
+        originalLane->setWaveform (shownSourcePeaks.get());
+
+    for (auto* lane : stemLanes)
+    {
+        const WaveformPeaks* peaks = nullptr;
+
+        if (shownPlaybackStems != nullptr)
+            for (size_t i = 0; i < shownPlaybackStems->stems.size(); ++i)
+                if (shownPlaybackStems->stems[i].type == *lane->getType() && i < shownPlaybackStems->peaks.size())
+                    peaks = &shownPlaybackStems->peaks[i];
+
+        lane->setWaveform (peaks);
+    }
 }
 
 void StemSplitterEditor::layoutLanes()
@@ -532,6 +586,16 @@ void StemSplitterEditor::timerCallback()
 
     if (exportThread != nullptr)
         exportPanel.setBusy (! exportThread->finished.load(), exportThread->progress.load());
+
+    const auto& cleanupEngine = proc.getCleanupEngine();
+
+    if ((cleanupEngine.isRendering() || cleanupEngine.isAnalysing()) && tick % 4 == 0)
+    {
+        cleanupPanel.refresh();
+        exportPanel.refresh();
+    }
+
+    updateTimerRate();
 }
 
 //==============================================================================
@@ -606,11 +670,18 @@ void StemSplitterEditor::locateModelFiles()
 //==============================================================================
 void StemSplitterEditor::startExport()
 {
-    const auto source = proc.getSource();
-    const auto stems = proc.getStems();
+    // Exports contain exactly what you hear, including the clean-up.
+    const auto source = proc.getPlaybackSource();
+    const auto stems = proc.getPlaybackStems();
 
     if (source == nullptr || (exportThread != nullptr && ! exportThread->finished.load()))
         return;
+
+    if (! proc.isCleanupUpToDate())
+    {
+        showToast ("The clean-up is still being applied. Export again in a moment.");
+        return;
+    }
 
     const auto prefs = proc.getExportPreferences();
     MixRenderer::ExportOptions options;
@@ -661,7 +732,10 @@ void StemSplitterEditor::startExport()
 
     // Custom mix
     const auto mix = proc.getMix();
-    const auto description = MixRenderer::describeMix (stems.get(), mix, true);
+    auto description = MixRenderer::describeMix (stems.get(), mix, true);
+
+    if (proc.isCleanupActive())
+        description = description == "Mix" ? juce::String ("Cleaned") : description + " + Cleaned";
     const auto defaultFile = startFolder.getChildFile (AudioIO::makeSafeFileName (songName + " (" + description + ")") + ".wav");
 
     chooser = std::make_unique<juce::FileChooser> ("Save the mix as", defaultFile, "*.wav");
@@ -721,8 +795,8 @@ void StemSplitterEditor::runExport (std::function<juce::Result (juce::Array<juce
 
 void StemSplitterEditor::dragStemOut (StemType type)
 {
-    const auto source = proc.getSource();
-    const auto stems = proc.getStems();
+    const auto source = proc.getPlaybackSource();
+    const auto stems = proc.getPlaybackStems();
 
     if (source == nullptr || stems == nullptr || stems->find (type) == nullptr)
         return;
@@ -846,6 +920,16 @@ bool StemSplitterEditor::keyPressed (const juce::KeyPress& key)
     {
         proc.setPlaying (false);
         proc.seekToStart();
+        return true;
+    }
+
+    if (key == juce::KeyPress ('b') || key == juce::KeyPress ('B'))
+    {
+        // A/B the clean-up
+        auto s = proc.getCleanupSettings();
+        s.enabled = ! s.enabled;
+        proc.setCleanupSettings (s);
+        showToast (s.enabled ? "Clean-up on" : "Clean-up off (original)");
         return true;
     }
 

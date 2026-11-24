@@ -108,6 +108,9 @@ juce::Colour StemLane::getColour() const
 
 void StemLane::setWaveform (const WaveformPeaks* newPeaks)
 {
+    if (newPeaks == peaks)
+        return;
+
     peaks = newPeaks;
     rebuildWavePath();
     repaint();

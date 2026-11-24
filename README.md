@@ -9,6 +9,20 @@ stem as its own WAV, or a single WAV with any instrument or frequency range remo
 - **State-of-the-art separation**: Meta's Demucs v4 hybrid transformer neural network, run natively in C++
   ([demucs.cpp](https://github.com/sevagh/demucs.cpp)) on all CPU cores, with Apple Accelerate on macOS.
   Everything runs on your Mac; no cloud.
+- **CPU efficient**: the inference engine is optimised (faster convolutions, norms and attention, with
+  identical results) and the song is split into segments processed in parallel on every core: about 4x faster
+  than a straightforward demucs.cpp integration. The UI idles at under 1% CPU.
+- **Clean up recordings** (the *Clean up* tab), applied to the original, every stem and all exports:
+  - **Background noise** reduction for fans, air conditioning, hiss and room tone. The noise profile is learned
+    automatically from the quietest parts, or from a spot you pick (*Learn at playhead*).
+  - **Mains hum** removal (50/60 Hz, detected automatically) with up to 20 harmonics.
+  - **Remove specific frequencies**: click a peak in the spectrum to notch it out (fan whine, buzz, whistle);
+    *Find tones* detects steady tones for you.
+  - **Rumble** filter for traffic, handling noise and wind.
+  - Rendered in the background when you change a setting, so playback has no real-time cost. Press **B** to
+    compare with the original instantly. Zero-phase filters keep everything sample-aligned.
+
+  ![Clean up](docs/screenshot-cleanup.png)
 - **Drag and drop**: drop a WAV (AIFF, FLAC and MP3 work too) anywhere on the window.
 - **Four engines**
   | Engine | Stems | Notes |
@@ -47,7 +61,10 @@ The DMG is a universal binary (Apple silicon + Intel) built for macOS 11 and lat
 3. Press **Separate**. Progress and time remaining are shown; *Cancel* (or Esc) stops it.
 4. Listen and tweak, then **Export** from the right-hand panel.
 
-Keyboard: <kbd>Space</kbd> play/pause · <kbd>Return</kbd> back to start · <kbd>L</kbd> loop ·
+To repair a recording, open the **Clean up** tab: switch it on, tick what to remove, and click any peak in the
+spectrum to remove that frequency. Press <kbd>B</kbd> to A/B against the original.
+
+Keyboard: <kbd>Space</kbd> play/pause · <kbd>Return</kbd> back to start · <kbd>L</kbd> loop · <kbd>B</kbd> clean-up on/off ·
 <kbd>←</kbd>/<kbd>→</kbd> skip 5 s · <kbd>⌘O</kbd> open · <kbd>⌘E</kbd> export · <kbd>Esc</kbd> cancel.
 
 In a DAW the plug-in works as a self-contained separator and player: it plays the loaded song (with your mutes,
@@ -99,13 +116,16 @@ stemsplit --engine 6 --out stems/ song.wav           # 6 stems into ./stems
 stemsplit --remove vocals song.wav                   # "song (No Vocals).wav"
 stemsplit --remove vocals,drums --cut low:80 song.wav
 stemsplit --cut band:250-4000 --bits 16 song.wav     # frequency removal only, no separation
+stemsplit --denoise 18 --dehum auto --notch 1900 take.wav   # clean up a recording
+stemsplit --analyse take.wav                         # detected hum, suggested tones, noise floor
 stemsplit --list-models                              # where models are looked for
 ```
 
 ## Project layout
 
 ```
-Source/Core/        engine: audio I/O + resampling, Demucs and Lite separators, frequency cut,
+Source/Core/        engine: audio I/O + resampling, Demucs and Lite separators, frequency cut, clean-up
+                    (noise reduction, hum, notches, rumble) with its background renderer,
                     mix rendering/export, model manager/downloader, background separation job
 Source/UI/          look and feel, header, drop zone, stem lanes, export panel, response-curve editor
 Source/PluginProcessor.*   song state, stem mixer and real-time preview playback (with resampling)
@@ -114,6 +134,7 @@ Source/StandaloneApp.cpp   native-window standalone app (output-only audio)
 Tools/stemsplit.cpp        command-line tool and DSP self tests
 Tests/                     processor/playback/UI tests (run with ctest)
 cmake/Demucs.cmake         builds demucs.cpp + Eigen as a static library
+ThirdParty/demucs-fast/    speed-ups applied to demucs.cpp at configure time (same results, ~2.3x faster)
 ```
 
 ## Credits and licences

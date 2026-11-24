@@ -34,5 +34,10 @@ QUICK START
                      and/or switch on "Remove frequencies" to cut a low, high or band of frequencies.
   You can also drag a stem's handle (the dots on the right of each lane) straight into Finder or a DAW.
 
-Keyboard: Space play/pause, Return back to start, L loop, Left/Right skip 5 s,
+  To repair a noisy recording, open the "Clean up" tab (top right): switch on Clean up, then choose
+  Background noise (fans, AC, hiss), Mains hum and/or Rumble. Click any peak in the spectrum to remove that
+  frequency, or press "Find tones". For the best noise reduction, put the playhead on a moment with only
+  noise (e.g. before the music starts) and click "Learn at playhead". Press B to compare with the original.
+
+Keyboard: Space play/pause, Return back to start, L loop, B clean-up on/off, Left/Right skip 5 s,
           Cmd+O open, Cmd+E export, Esc cancel.

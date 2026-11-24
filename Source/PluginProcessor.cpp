@@ -6,6 +6,12 @@ namespace stemsplitter
 
 namespace
 {
+    juce::String formatSeconds (double seconds)
+    {
+        const int mins = (int) (seconds / 60.0);
+        return juce::String (mins) + ":" + juce::String (seconds - mins * 60.0, 1).paddedLeft ('0', 4);
+    }
+
     /** Decodes a file on a background thread and hands the result back on the message thread. */
     class FileLoaderThread final : public juce::Thread
     {
@@ -70,6 +76,12 @@ StemSplitterProcessor::StemSplitterProcessor (bool isStandalone)
             notify ("Separation failed: " + r.getErrorMessage());
         }
 
+        sendChangeMessage();
+    };
+
+    cleanup.onChange = [this]
+    {
+        publishPlaybackState();   // swap in freshly cleaned audio
         sendChangeMessage();
     };
 
@@ -385,7 +397,7 @@ void StemSplitterProcessor::adoptSource (std::shared_ptr<const SourceAudio> audi
 {
     setPlaying (false);
     source = std::move (audio);
-    sourcePeaks = std::move (peaks);
+    sourcePeaks = std::make_shared<const WaveformPeaks> (std::move (peaks));
     stems.reset();
     publishPlaybackState();
     seekToStart();
@@ -398,7 +410,7 @@ void StemSplitterProcessor::closeFile()
     setPlaying (false);
     source.reset();
     stems.reset();
-    sourcePeaks = {};
+    sourcePeaks.reset();
     publishPlaybackState();
     seekToStart();
     sendChangeMessage();
@@ -406,13 +418,97 @@ void StemSplitterProcessor::closeFile()
 
 void StemSplitterProcessor::publishPlaybackState()
 {
-    PlaybackState newState { source, stems };
+    cleanup.setInputs (source, stems);   // no-op unless the song or the stems changed
+    PlaybackState newState { getPlaybackSource(), getPlaybackStems() };
 
     {
         const juce::SpinLock::ScopedLockType lock (playbackLock);
         std::swap (playback, newState);
     }
     // the previous state (and possibly its audio) is released here, off the audio thread
+}
+
+//==============================================================================
+void StemSplitterProcessor::setCleanupSettings (const CleanupSettings& s)
+{
+    auto clamped = s;
+    clamped.reductionDb = juce::jlimit (3.0f, 40.0f, clamped.reductionDb);
+    clamped.sensitivity = juce::jlimit (0.0f, 1.0f, clamped.sensitivity);
+    clamped.humHarmonics = juce::jlimit (1, 40, clamped.humHarmonics);
+    clamped.rumbleHz = juce::jlimit (20.0f, 200.0f, clamped.rumbleHz);
+    clamped.notchWidth = juce::jlimit (0.0f, 1.0f, clamped.notchWidth);
+
+    if (clamped.notchesHz.size() > (size_t) CleanupSettings::maxNotches)
+        clamped.notchesHz.resize ((size_t) CleanupSettings::maxNotches);
+
+    if (clamped == cleanupSettings)
+        return;
+
+    cleanupSettings = clamped;
+    cleanup.setSettings (cleanupSettings);
+    publishPlaybackState();   // switching clean-up on/off is instant when a render is available
+    sendChangeMessage();
+}
+
+void StemSplitterProcessor::learnNoiseProfileAtPlayhead (double seconds)
+{
+    if (source == nullptr)
+        return;
+
+    const auto start = (int) juce::jlimit ((juce::int64) 0, (juce::int64) source->getNumSamples(), getPlayPosition());
+    const int length = juce::jmin ((int) (seconds * source->sampleRate), source->getNumSamples() - start);
+
+    if (length < (int) (0.2 * source->sampleRate))
+    {
+        notify ("Move the playhead to a spot with at least a second of noise after it.");
+        return;
+    }
+
+    cleanup.setCustomProfile (NoiseCleanup::learnProfile (source->buffer, source->sampleRate, start, length));
+
+    auto s = cleanupSettings;
+    s.enabled = s.denoise = true;
+    setCleanupSettings (s);
+    notify ("Learned the noise from " + formatSeconds (start / source->sampleRate) + " to "
+            + formatSeconds ((start + length) / source->sampleRate));
+}
+
+void StemSplitterProcessor::useAutomaticNoiseProfile()
+{
+    cleanup.clearCustomProfile();
+    sendChangeMessage();
+}
+
+bool StemSplitterProcessor::isCleanupUpToDate() const
+{
+    return ! cleanupSettings.hasAnyEffect() || cleanup.isResultCurrent (cleanupSettings);
+}
+
+std::shared_ptr<const SourceAudio> StemSplitterProcessor::getPlaybackSource() const
+{
+    if (cleanupSettings.hasAnyEffect())
+        if (auto r = cleanup.getResult(); r != nullptr && r->inputSource == source && source != nullptr)
+            return r->source;
+
+    return source;
+}
+
+std::shared_ptr<const StemSet> StemSplitterProcessor::getPlaybackStems() const
+{
+    if (cleanupSettings.hasAnyEffect() && stems != nullptr)
+        if (auto r = cleanup.getResult(); r != nullptr && r->inputSource == source && r->inputStems == stems && r->stems != nullptr)
+            return r->stems;
+
+    return stems;
+}
+
+std::shared_ptr<const WaveformPeaks> StemSplitterProcessor::getPlaybackSourcePeaks() const
+{
+    if (cleanupSettings.hasAnyEffect())
+        if (auto r = cleanup.getResult(); r != nullptr && r->inputSource == source && source != nullptr)
+            return std::shared_ptr<const WaveformPeaks> (r, &r->sourcePeaks);   // keeps the result alive
+
+    return sourcePeaks;
 }
 
 //==============================================================================
@@ -575,6 +671,24 @@ void StemSplitterProcessor::getStateInformation (juce::MemoryBlock& destData)
     cutXml->setAttribute ("high", (double) mix.cut.highHz);
     cutXml->setAttribute ("amount", (double) mix.cut.amount);
 
+    auto* cleanXml = xml.createNewChildElement ("Cleanup");
+    const auto& c = cleanupSettings;
+    cleanXml->setAttribute ("enabled", c.enabled);
+    cleanXml->setAttribute ("denoise", c.denoise);
+    cleanXml->setAttribute ("reduction", (double) c.reductionDb);
+    cleanXml->setAttribute ("sensitivity", (double) c.sensitivity);
+    cleanXml->setAttribute ("dehum", c.dehum);
+    cleanXml->setAttribute ("humHz", c.humHz);
+    cleanXml->setAttribute ("harmonics", c.humHarmonics);
+    cleanXml->setAttribute ("notchWidth", (double) c.notchWidth);
+    cleanXml->setAttribute ("rumble", c.rumble);
+    cleanXml->setAttribute ("rumbleHz", (double) c.rumbleHz);
+
+    juce::StringArray notches;
+    for (auto hz : c.notchesHz)
+        notches.add (juce::String (hz, 2));
+    cleanXml->setAttribute ("notches", notches.joinIntoString (" "));
+
     auto* exportXml = xml.createNewChildElement ("Export");
     exportXml->setAttribute ("mode", (int) exportPrefs.mode);
     exportXml->setAttribute ("bits", (int) exportPrefs.bitDepth);
@@ -641,6 +755,27 @@ void StemSplitterProcessor::setStateInformation (const void* data, int sizeInByt
     }
 
     setMix (m);
+
+    if (auto* cleanXml = xml->getChildByName ("Cleanup"))
+    {
+        CleanupSettings c;
+        c.enabled = cleanXml->getBoolAttribute ("enabled", false);
+        c.denoise = cleanXml->getBoolAttribute ("denoise", true);
+        c.reductionDb = (float) cleanXml->getDoubleAttribute ("reduction", 15.0);
+        c.sensitivity = (float) cleanXml->getDoubleAttribute ("sensitivity", 0.5);
+        c.dehum = cleanXml->getBoolAttribute ("dehum", false);
+        c.humHz = cleanXml->getIntAttribute ("humHz", 0);
+        c.humHarmonics = cleanXml->getIntAttribute ("harmonics", 8);
+        c.notchWidth = (float) cleanXml->getDoubleAttribute ("notchWidth", 0.5);
+        c.rumble = cleanXml->getBoolAttribute ("rumble", false);
+        c.rumbleHz = (float) cleanXml->getDoubleAttribute ("rumbleHz", 50.0);
+
+        for (auto& t : juce::StringArray::fromTokens (cleanXml->getStringAttribute ("notches"), " ", ""))
+            if (t.getFloatValue() > 0.0f)
+                c.notchesHz.push_back (t.getFloatValue());
+
+        setCleanupSettings (c);
+    }
 
     const juce::File file (xml->getStringAttribute ("file"));
 

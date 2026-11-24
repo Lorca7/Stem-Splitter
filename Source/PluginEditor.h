@@ -1,6 +1,7 @@
 #pragma once
 
 #include "PluginProcessor.h"
+#include "UI/CleanupPanel.h"
 #include "UI/DropZone.h"
 #include "UI/ExportPanel.h"
 #include "UI/HeaderBar.h"
@@ -39,6 +40,7 @@ private:
 
     void refreshAll();
     void rebuildLanesIfNeeded();
+    void syncWaveforms();
     void layoutLanes();
     void updateLaneStates();
     void updatePlayheads();
@@ -52,6 +54,8 @@ private:
     void dragStemOut (StemType type);
     void showToast (const juce::String& message, const juce::File& revealTarget = {});
     void seekToFraction (double fraction);
+    void showSideTab (int index);
+    void updateTimerRate();
 
     juce::Rectangle<int> getMainArea() const;
     juce::Rectangle<int> getFileRowArea() const;
@@ -62,6 +66,8 @@ private:
 
     HeaderBar header;
     TransportBar transport;
+    SegmentedControl sideTabs;
+    CleanupPanel cleanupPanel;
     ExportPanel exportPanel;
     DropZone dropZone;
 
@@ -81,7 +87,10 @@ private:
 
     std::shared_ptr<const SourceAudio> shownSource;
     std::shared_ptr<const StemSet> shownStems;
+    std::shared_ptr<const WaveformPeaks> shownSourcePeaks;
+    std::shared_ptr<const StemSet> shownPlaybackStems;
     EngineType shownEngine = EngineType::numEngines;
+    juce::Rectangle<int> sideTabArea;
     bool fileDragOver = false;
     int tick = 0;
 

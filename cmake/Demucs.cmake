@@ -14,6 +14,22 @@ FetchContent_MakeAvailable(demucscpp)
 
 set(DEMUCS_SRC_DIR "${demucscpp_SOURCE_DIR}/src")
 
+# Speed-ups (identical results, roughly 2-3x faster per segment): see ThirdParty/demucs-fast.
+execute_process(
+    COMMAND ${CMAKE_COMMAND}
+            -DDEMUCS_DIR=${demucscpp_SOURCE_DIR}
+            -DPATCH_DIR=${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/demucs-fast
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/demucs-fast/apply.cmake
+    RESULT_VARIABLE demucs_patch_result)
+
+if(NOT demucs_patch_result EQUAL 0)
+    message(FATAL_ERROR "Patching demucs.cpp failed")
+endif()
+
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/demucs-fast/conv.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/demucs-fast/layers.patch)
+
 add_library(stemsplitter_demucs STATIC
     ${DEMUCS_SRC_DIR}/crosstransformer.cpp
     ${DEMUCS_SRC_DIR}/dsp.cpp

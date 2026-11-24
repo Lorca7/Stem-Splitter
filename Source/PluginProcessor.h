@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Core/CleanupEngine.h"
 #include "Core/MixRenderer.h"
 #include "Core/ModelManager.h"
 #include "Core/SeparationJob.h"
@@ -65,7 +66,7 @@ public:
     bool isLoadingFile() const noexcept                     { return loading; }
     std::shared_ptr<const SourceAudio> getSource() const    { return source; }
     std::shared_ptr<const StemSet> getStems() const         { return stems; }
-    const WaveformPeaks& getSourcePeaks() const noexcept    { return sourcePeaks; }
+    std::shared_ptr<const WaveformPeaks> getSourcePeaks() const { return sourcePeaks; }
 
     // Separation
     EngineType getEngine() const noexcept                   { return engine; }
@@ -87,6 +88,22 @@ public:
     void setStemSolo (StemType t, bool solo);
     void setStemGain (StemType t, float gainDb);
     void setFrequencyCut (const FrequencyCutSettings& cut);
+
+    // Clean-up (noise, hum, tones, rumble): applies to the original, every stem and all exports
+    const CleanupSettings& getCleanupSettings() const noexcept { return cleanupSettings; }
+    void setCleanupSettings (const CleanupSettings& s);
+    const CleanupEngine& getCleanupEngine() const noexcept   { return cleanup; }
+    /** Learns the noise from the next few seconds after the playhead (which should contain only noise). */
+    void learnNoiseProfileAtPlayhead (double seconds = 2.0);
+    void useAutomaticNoiseProfile();
+    /** True when everything that's heard and exported has the current clean-up settings applied. */
+    bool isCleanupUpToDate() const;
+    bool isCleanupActive() const noexcept                    { return cleanupSettings.hasAnyEffect(); }
+
+    /** What you hear and what gets exported: the cleaned audio when clean-up is on, else the original. */
+    std::shared_ptr<const SourceAudio> getPlaybackSource() const;
+    std::shared_ptr<const StemSet> getPlaybackStems() const;
+    std::shared_ptr<const WaveformPeaks> getPlaybackSourcePeaks() const;
 
     // Export
     const ExportPreferences& getExportPreferences() const noexcept { return exportPrefs; }
@@ -130,7 +147,7 @@ private:
 
     std::shared_ptr<const SourceAudio> source;
     std::shared_ptr<const StemSet> stems;
-    WaveformPeaks sourcePeaks;
+    std::shared_ptr<const WaveformPeaks> sourcePeaks;
     juce::File pendingFile;
     std::atomic<bool> loading { false };
     std::unique_ptr<juce::Thread> loaderThread;
@@ -141,6 +158,8 @@ private:
 
     MixSettings mix;
     ExportPreferences exportPrefs;
+    CleanupSettings cleanupSettings;
+    CleanupEngine cleanup;
     juce::String notification;
 
     // Shared with the audio thread

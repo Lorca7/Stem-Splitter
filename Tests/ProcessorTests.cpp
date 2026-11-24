@@ -185,6 +185,54 @@ int main()
             check (maxDifference (out, 0, offline, pos, 8000) < 1.0e-5f, "preview and mix export render identically");
         }
 
+        // 7a. Clean-up: playback and exports switch to the cleaned audio once it's rendered
+        {
+            p.setMix (MixSettings{});   // everything audible again
+            check (pumpUntil ([&p] { return p.getCleanupEngine().getAnalysis() != nullptr; }, 30000), "clean-up analysis runs after loading");
+
+            CleanupSettings c;
+            c.enabled = true;
+            c.denoise = false;
+            c.notchesHz = { 440.0f };
+            c.rumble = true;
+            c.rumbleHz = 60.0f;
+            p.setCleanupSettings (c);
+
+            check (! p.isCleanupUpToDate(), "export waits while the clean-up renders");
+            const bool rendered = pumpUntil ([&p] { return p.isCleanupUpToDate(); }, 60000);
+            check (rendered, "clean-up renders in the background");
+
+            const auto analysis = p.getCleanupEngine().getAnalysis();
+            const auto expected = NoiseCleanup::process (source->buffer, source->sampleRate, c, analysis->autoProfile,
+                                                         NoiseCleanup::resolveHumHz (c, *analysis));
+            check (p.getPlaybackSource() != p.getSource()
+                       && maxDifference (p.getPlaybackSource()->buffer, 0, expected, 0, source->getNumSamples()) < 1.0e-6f,
+                   "cleaned original matches the offline processing");
+
+            const auto cleanStems = p.getPlaybackStems();
+            check (cleanStems != nullptr && cleanStems != p.getStems(), "every stem is cleaned too");
+
+            p.seekToSample (0);
+            p.setPlaying (true);
+            render (p, 44100.0, 0.05);
+            const auto pos = (int) p.getPlayPosition();
+            auto heard = render (p, 44100.0, 0.25);
+            const auto offline = MixRenderer::renderMix (*p.getPlaybackSource(), cleanStems.get(), p.getMix(), true);
+            check (maxDifference (heard, 0, offline, pos, 8000) < 1.0e-5f, "you hear exactly what gets exported (with clean-up)");
+
+            // A/B: switching off is instant and bit-exact
+            auto off = c;
+            off.enabled = false;
+            p.setCleanupSettings (off);
+            check (p.getPlaybackSource() == p.getSource() && p.getPlaybackStems() == p.getStems() && p.isCleanupUpToDate(),
+                   "bypassing the clean-up restores the original instantly");
+
+            p.setCleanupSettings (c);
+            check (p.isCleanupUpToDate() && p.getPlaybackSource() != p.getSource(),
+                   "switching back on reuses the rendered clean-up (no re-render)");
+            p.setPlaying (false);
+        }
+
         // 7. State round trip
         auto mix = p.getMix();
         mix.stems[(size_t) toIndex (StemType::vocals)].gainDb = -4.5f;
@@ -206,7 +254,8 @@ int main()
                    && restored.getMix().cut == mix.cut
                    && restored.getExportPreferences().mode == ExportMode::mix
                    && restored.getExportPreferences().bitDepth == AudioIO::BitDepth::int16
-                   && restored.getEngine() == EngineType::lite,
+                   && restored.getEngine() == EngineType::lite
+                   && restored.getCleanupSettings() == p.getCleanupSettings(),
                "plug-in state saves and restores");
 
         // 8. Editor smoke test: build, lay out, refresh and destroy the full UI
